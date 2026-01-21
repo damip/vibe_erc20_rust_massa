@@ -1,505 +1,728 @@
-//! ERC20 Token Implementation for Massa Blockchain
+//! MRC20 Fungible Token Implementation for Massa Blockchain
 //!
-//! This contract implements a standard ERC20-like token with the following features:
-//! - Token metadata (name, symbol, decimals)
-//! - Balance tracking per address
-//! - Transfer functionality
-//! - Approval and allowance mechanism for delegated transfers
+//! This contract implements the MRC20 standard (Massa's ERC20 equivalent) with full
+//! compatibility with the AssemblyScript reference implementation from massa-standards.
+//!
+//! # Compatibility
+//! - Storage format matches AS implementation exactly
+//! - Function signatures match AS implementation
+//! - Event names and formats match AS implementation
+//! - Can be deployed using the same deployer as AS contracts
 //!
 //! # Storage Keys
-//! - `NAME`: Token name (string)
-//! - `SYMBOL`: Token symbol (string)
-//! - `DECIMALS`: Token decimals (u8)
-//! - `TOTAL_SUPPLY`: Total supply (u64)
-//! - `BALANCE:{address}`: Balance of address (u64)
-//! - `ALLOWANCE:{owner}:{spender}`: Allowance amount (u64)
+//! - `NAME`: Token name as raw bytes
+//! - `SYMBOL`: Token symbol as raw bytes
+//! - `DECIMALS`: Single byte [u8]
+//! - `TOTAL_SUPPLY`: u256 as 32 bytes (little-endian)
+//! - `BALANCE{address}`: Balance for address, value is u256
+//! - `ALLOWANCE{owner}{spender}`: Allowance, value is u256
+//! - `OWNER`: Owner address as raw string bytes
 
 #![no_std]
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use massa_export::massa_export;
 use massa_sc_sdk::{abi, context, storage, Args};
 
-// Storage key prefixes
-const KEY_NAME: &[u8] = b"NAME";
-const KEY_SYMBOL: &[u8] = b"SYMBOL";
-const KEY_DECIMALS: &[u8] = b"DECIMALS";
-const KEY_TOTAL_SUPPLY: &[u8] = b"TOTAL_SUPPLY";
-const KEY_BALANCE_PREFIX: &[u8] = b"BALANCE:";
-const KEY_ALLOWANCE_PREFIX: &[u8] = b"ALLOWANCE:";
+// ============================================================================
+// U256 Implementation (little-endian, compatible with AS as-bignum)
+// ============================================================================
 
-/// Build the storage key for a balance entry.
+/// 256-bit unsigned integer, little-endian byte order
+/// Compatible with AssemblyScript's as-bignum u256
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct U256(pub [u8; 32]);
+
+impl U256 {
+    pub const ZERO: U256 = U256([0u8; 32]);
+    pub const MAX: U256 = U256([0xFF; 32]);
+
+    pub fn from_le_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn to_le_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub fn from_u64(value: u64) -> Self {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Self(bytes)
+    }
+
+    /// Checked addition, returns None on overflow
+    pub fn checked_add(self, other: U256) -> Option<U256> {
+        let mut result = [0u8; 32];
+        let mut carry: u16 = 0;
+        for i in 0..32 {
+            let sum = self.0[i] as u16 + other.0[i] as u16 + carry;
+            result[i] = sum as u8;
+            carry = sum >> 8;
+        }
+        if carry != 0 {
+            None // Overflow
+        } else {
+            Some(U256(result))
+        }
+    }
+
+    /// Checked subtraction, returns None on underflow
+    pub fn checked_sub(self, other: U256) -> Option<U256> {
+        if self < other {
+            return None;
+        }
+        let mut result = [0u8; 32];
+        let mut borrow: i16 = 0;
+        for i in 0..32 {
+            let diff = self.0[i] as i16 - other.0[i] as i16 - borrow;
+            if diff < 0 {
+                result[i] = (diff + 256) as u8;
+                borrow = 1;
+            } else {
+                result[i] = diff as u8;
+                borrow = 0;
+            }
+        }
+        Some(U256(result))
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
+}
+
+impl PartialOrd for U256 {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for U256 {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Compare from most significant byte to least significant
+        for i in (0..32).rev() {
+            match self.0[i].cmp(&other.0[i]) {
+                core::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+        core::cmp::Ordering::Equal
+    }
+}
+
+// ============================================================================
+// Constants - Storage Keys (matching AS implementation exactly)
+// ============================================================================
+
+const VERSION: &[u8] = b"0.0.1";
+const NAME_KEY: &[u8] = b"NAME";
+const SYMBOL_KEY: &[u8] = b"SYMBOL";
+const DECIMALS_KEY: &[u8] = b"DECIMALS";
+const TOTAL_SUPPLY_KEY: &[u8] = b"TOTAL_SUPPLY";
+const BALANCE_KEY_PREFIX: &[u8] = b"BALANCE";
+const ALLOWANCE_KEY_PREFIX: &[u8] = b"ALLOWANCE";
+const OWNER_KEY: &[u8] = b"OWNER";
+
+// Event names (matching AS implementation exactly)
+const TRANSFER_EVENT: &str = "TRANSFER SUCCESS";
+const APPROVAL_EVENT: &str = "APPROVAL SUCCESS";
+const MINT_EVENT: &str = "MINT SUCCESS";
+const BURN_EVENT: &str = "BURN_SUCCESS";
+const CHANGE_OWNER_EVENT: &str = "CHANGE_OWNER";
+
+// ============================================================================
+// Storage Key Builders
+// ============================================================================
+
+/// Build balance key: "BALANCE" + address
 fn balance_key(address: &str) -> Vec<u8> {
-    let mut key = KEY_BALANCE_PREFIX.to_vec();
+    let mut key = BALANCE_KEY_PREFIX.to_vec();
     key.extend_from_slice(address.as_bytes());
     key
 }
 
-/// Build the storage key for an allowance entry.
+/// Build allowance key: "ALLOWANCE" + owner + spender
 fn allowance_key(owner: &str, spender: &str) -> Vec<u8> {
-    let mut key = KEY_ALLOWANCE_PREFIX.to_vec();
+    let mut key = ALLOWANCE_KEY_PREFIX.to_vec();
     key.extend_from_slice(owner.as_bytes());
-    key.push(b':');
     key.extend_from_slice(spender.as_bytes());
     key
 }
 
-/// Get balance for an address from storage.
-fn get_balance_internal(address: &str) -> u64 {
+// ============================================================================
+// Internal Storage Helpers
+// ============================================================================
+
+fn get_balance(address: &str) -> U256 {
     let key = balance_key(address);
     if !storage::has(&key) {
-        return 0;
+        return U256::ZERO;
     }
     let data = storage::get(&key);
-    if data.len() >= 8 {
-        u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ])
+    if data.len() >= 32 {
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data[..32]);
+        U256::from_le_bytes(bytes)
     } else {
-        0
+        U256::ZERO
     }
 }
 
-/// Set balance for an address in storage.
-fn set_balance_internal(address: &str, amount: u64) {
+fn set_balance(address: &str, amount: U256) {
     let key = balance_key(address);
     storage::set(&key, &amount.to_le_bytes());
 }
 
-/// Get allowance for owner/spender pair from storage.
-fn get_allowance_internal(owner: &str, spender: &str) -> u64 {
+fn get_allowance(owner: &str, spender: &str) -> U256 {
     let key = allowance_key(owner, spender);
     if !storage::has(&key) {
-        return 0;
+        return U256::ZERO;
     }
     let data = storage::get(&key);
-    if data.len() >= 8 {
-        u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ])
+    if data.len() >= 32 {
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data[..32]);
+        U256::from_le_bytes(bytes)
     } else {
-        0
+        U256::ZERO
     }
 }
 
-/// Set allowance for owner/spender pair in storage.
-fn set_allowance_internal(owner: &str, spender: &str, amount: u64) {
+fn set_allowance(owner: &str, spender: &str, amount: U256) {
     let key = allowance_key(owner, spender);
     storage::set(&key, &amount.to_le_bytes());
 }
 
-/// Constructor - Initialize the ERC20 token.
+fn get_total_supply() -> U256 {
+    if !storage::has(TOTAL_SUPPLY_KEY) {
+        return U256::ZERO;
+    }
+    let data = storage::get(TOTAL_SUPPLY_KEY);
+    if data.len() >= 32 {
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&data[..32]);
+        U256::from_le_bytes(bytes)
+    } else {
+        U256::ZERO
+    }
+}
+
+fn set_total_supply(amount: U256) {
+    storage::set(TOTAL_SUPPLY_KEY, &amount.to_le_bytes());
+}
+
+fn get_owner() -> Option<String> {
+    if !storage::has(OWNER_KEY) {
+        return None;
+    }
+    let data = storage::get(OWNER_KEY);
+    core::str::from_utf8(&data).ok().map(|s| String::from(s))
+}
+
+fn set_owner_internal(owner: &str) {
+    storage::set(OWNER_KEY, owner.as_bytes());
+}
+
+fn only_owner() {
+    let owner = get_owner();
+    assert!(owner.is_some(), "Owner is not set");
+    let caller = context::caller();
+    assert!(
+        caller == owner.unwrap(),
+        "Caller is not the owner"
+    );
+}
+
+fn is_owner_check(address: &str) -> bool {
+    match get_owner() {
+        Some(owner) => owner == address,
+        None => false,
+    }
+}
+
+// ============================================================================
+// Constructor
+// ============================================================================
+
+/// Constructor - Initialize the MRC20 token.
 ///
-/// # Arguments
+/// # Arguments (Args serialized)
 /// - `name`: Token name (string)
 /// - `symbol`: Token symbol (string)
-/// - `decimals`: Token decimals (u32, typically 18)
-/// - `initial_supply`: Initial supply to mint to deployer (u64)
+/// - `decimals`: Token decimals (u8)
+/// - `totalSupply`: Initial supply as u256 (32 bytes)
 ///
-/// # Events
-/// - `ERC20_DEPLOYED:{name}:{symbol}:{decimals}:{initial_supply}:{deployer}`
-/// - `TRANSFER:0x0:{deployer}:{initial_supply}` (mint event)
+/// The caller becomes the owner and receives all initial tokens.
 #[massa_export]
 pub fn constructor(binary_args: &[u8]) -> Vec<u8> {
-    // Only allow during deployment
-    if !context::is_deploying_contract() {
-        abi::generate_event("ERROR:constructor can only be called during deployment");
-        return Vec::new();
-    }
+    assert!(context::is_deploying_contract(), "Can only be called during deployment");
 
     let mut args = Args::from_bytes(binary_args.to_vec());
     let name = args.next_string().unwrap_or_else(|_| String::from("MassaToken"));
-    let symbol = args.next_string().unwrap_or_else(|_| String::from("MTK"));
-    let decimals = args.next_u32().unwrap_or(18) as u8;  // Read as u32 for CLI compatibility, cast to u8
-    let initial_supply = args.next_u64().unwrap_or(1_000_000_000_000_000_000); // 1 token with 18 decimals
+    let symbol = args.next_string().unwrap_or_else(|_| String::from("MT"));
+    let decimals = args.next_u8().unwrap_or(18);
+    
+    // Read u256 as 32 bytes
+    let total_supply = if let Ok(bytes) = args.next_bytes() {
+        if bytes.len() >= 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes[..32]);
+            U256::from_le_bytes(arr)
+        } else {
+            U256::from_u64(1_000_000_000_000_000_000) // Default 1 token with 18 decimals
+        }
+    } else {
+        U256::from_u64(1_000_000_000_000_000_000)
+    };
 
-    // Store token metadata
-    storage::set(KEY_NAME, name.as_bytes());
-    storage::set(KEY_SYMBOL, symbol.as_bytes());
-    storage::set(KEY_DECIMALS, &[decimals]);
-    storage::set(KEY_TOTAL_SUPPLY, &initial_supply.to_le_bytes());
+    // Store token metadata (raw bytes, matching AS format)
+    storage::set(NAME_KEY, name.as_bytes());
+    storage::set(SYMBOL_KEY, symbol.as_bytes());
+    storage::set(DECIMALS_KEY, &[decimals]);
+    set_total_supply(total_supply);
 
-    // Get deployer address (caller during deployment)
-    let deployer = context::caller();
+    // Set owner and mint initial supply to caller
+    let caller = context::caller();
+    set_owner_internal(&caller);
+    set_balance(&caller, total_supply);
 
-    // Mint initial supply to deployer
-    set_balance_internal(&deployer, initial_supply);
+    // Emit CHANGE_OWNER event (matching AS format: "CHANGE_OWNER:address")
+    abi::generate_event(&alloc::format!("{}:{}", CHANGE_OWNER_EVENT, caller));
 
-    abi::generate_event(&format!(
-        "ERC20_DEPLOYED:{}:{}:{}:{}:{}",
-        name, symbol, decimals, initial_supply, deployer
-    ));
-
-    abi::generate_event(&format!("TRANSFER:0x0:{}:{}", deployer, initial_supply));
-
-    Args::new().into_bytes()
+    Vec::new()
 }
 
-/// Get token name.
-///
-/// # Returns
-/// - Token name as string
+// ============================================================================
+// Token Attributes (read-only)
+// ============================================================================
+
+/// Returns the version of this smart contract.
+#[massa_export]
+pub fn version(_binary_args: &[u8]) -> Vec<u8> {
+    VERSION.to_vec()
+}
+
+/// Returns the name of the token (raw bytes, not Args-wrapped).
 #[massa_export]
 pub fn name(_binary_args: &[u8]) -> Vec<u8> {
-    let data = storage::get(KEY_NAME);
-    let name = core::str::from_utf8(&data).unwrap_or("Unknown");
-    let mut out = Args::new();
-    out.add_string(name);
-    out.into_bytes()
+    storage::get(NAME_KEY)
 }
 
-/// Get token symbol.
-///
-/// # Returns
-/// - Token symbol as string
+/// Returns the symbol of the token (raw bytes, not Args-wrapped).
 #[massa_export]
 pub fn symbol(_binary_args: &[u8]) -> Vec<u8> {
-    let data = storage::get(KEY_SYMBOL);
-    let symbol = core::str::from_utf8(&data).unwrap_or("???");
-    let mut out = Args::new();
-    out.add_string(symbol);
-    out.into_bytes()
+    storage::get(SYMBOL_KEY)
 }
 
-/// Get token decimals.
-///
-/// # Returns
-/// - Token decimals as u8
+/// Returns the decimals of the token (raw bytes, not Args-wrapped).
 #[massa_export]
 pub fn decimals(_binary_args: &[u8]) -> Vec<u8> {
-    let data = storage::get(KEY_DECIMALS);
-    let decimals = if data.is_empty() { 18 } else { data[0] };
-    let mut out = Args::new();
-    out.add_u8(decimals);
-    out.into_bytes()
+    storage::get(DECIMALS_KEY)
 }
 
-/// Get total supply.
-///
-/// # Returns
-/// - Total supply as u64
+/// Returns the total supply (raw u256 bytes, not Args-wrapped).
 #[massa_export]
 pub fn totalSupply(_binary_args: &[u8]) -> Vec<u8> {
-    let data = storage::get(KEY_TOTAL_SUPPLY);
-    let total = if data.len() >= 8 {
-        u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ])
-    } else {
-        0
-    };
-    let mut out = Args::new();
-    out.add_u64(total);
-    out.into_bytes()
+    storage::get(TOTAL_SUPPLY_KEY)
 }
 
-/// Get balance of an address.
+// ============================================================================
+// Balance
+// ============================================================================
+
+/// Returns the balance of an account (u256 bytes).
 ///
 /// # Arguments
-/// - `address`: Address to query balance for (string)
-///
-/// # Returns
-/// - Balance as u64
+/// - `address`: Account address (string)
 #[massa_export]
 pub fn balanceOf(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let address = args.next_string().unwrap_or_else(|_| String::new());
-
-    let balance = get_balance_internal(&address);
-
-    let mut out = Args::new();
-    out.add_u64(balance);
-    out.into_bytes()
+    let address = args.next_string().expect("Address argument is missing or invalid");
+    let balance = get_balance(&address);
+    balance.to_le_bytes().to_vec()
 }
 
-/// Transfer tokens from caller to recipient.
+// ============================================================================
+// Transfer
+// ============================================================================
+
+/// Transfers tokens from caller to recipient.
 ///
 /// # Arguments
 /// - `to`: Recipient address (string)
-/// - `amount`: Amount to transfer (u64)
-///
-/// # Returns
-/// - Success flag as bool
+/// - `amount`: Amount to transfer (u256 as bytes)
 ///
 /// # Events
-/// - `TRANSFER:{from}:{to}:{amount}` on success
-/// - `ERROR:...` on failure
+/// - `TRANSFER SUCCESS`
 #[massa_export]
 pub fn transfer(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let to = args.next_string().unwrap_or_else(|_| String::new());
-    let amount = args.next_u64().unwrap_or(0);
+    let to = args.next_string().expect("receiverAddress argument is missing or invalid");
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
+    } else {
+        panic!("amount argument is missing or invalid");
+    };
 
     let from = context::caller();
+    
+    assert!(from != to, "Transfer failed: cannot send tokens to own account");
 
-    // Validate inputs
-    if to.is_empty() {
-        abi::generate_event("ERROR:transfer to zero address");
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
+    let from_balance = get_balance(&from);
+    let to_balance = get_balance(&to);
+    
+    assert!(from_balance >= amount, "Transfer failed: insufficient funds");
+    
+    let new_to_balance = to_balance.checked_add(amount).expect("Transfer failed: overflow");
+    let new_from_balance = from_balance.checked_sub(amount).unwrap();
+    
+    set_balance(&from, new_from_balance);
+    set_balance(&to, new_to_balance);
 
-    let from_balance = get_balance_internal(&from);
-    if from_balance < amount {
-        abi::generate_event(&format!(
-            "ERROR:insufficient balance: has {} needs {}",
-            from_balance, amount
-        ));
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
+    abi::generate_event(TRANSFER_EVENT);
 
-    // Perform transfer
-    set_balance_internal(&from, from_balance - amount);
-    let to_balance = get_balance_internal(&to);
-    set_balance_internal(&to, to_balance + amount);
-
-    abi::generate_event(&format!("TRANSFER:{}:{}:{}", from, to, amount));
-
-    let mut out = Args::new();
-    out.add_bool(true);
-    out.into_bytes()
+    Vec::new()
 }
 
-/// Approve spender to spend tokens on behalf of caller.
-///
-/// # Arguments
-/// - `spender`: Spender address (string)
-/// - `amount`: Amount to approve (u64)
-///
-/// # Returns
-/// - Success flag as bool
-///
-/// # Events
-/// - `APPROVAL:{owner}:{spender}:{amount}`
-#[massa_export]
-pub fn approve(binary_args: &[u8]) -> Vec<u8> {
-    let mut args = Args::from_bytes(binary_args.to_vec());
-    let spender = args.next_string().unwrap_or_else(|_| String::new());
-    let amount = args.next_u64().unwrap_or(0);
+// ============================================================================
+// Allowance
+// ============================================================================
 
-    let owner = context::caller();
-
-    if spender.is_empty() {
-        abi::generate_event("ERROR:approve to zero address");
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
-
-    set_allowance_internal(&owner, &spender, amount);
-
-    abi::generate_event(&format!("APPROVAL:{}:{}:{}", owner, spender, amount));
-
-    let mut out = Args::new();
-    out.add_bool(true);
-    out.into_bytes()
-}
-
-/// Get allowance for owner/spender pair.
+/// Returns the allowance for owner/spender (u256 bytes).
 ///
 /// # Arguments
 /// - `owner`: Owner address (string)
 /// - `spender`: Spender address (string)
-///
-/// # Returns
-/// - Allowance amount as u64
 #[massa_export]
 pub fn allowance(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let owner = args.next_string().unwrap_or_else(|_| String::new());
-    let spender = args.next_string().unwrap_or_else(|_| String::new());
-
-    let amount = get_allowance_internal(&owner, &spender);
-
-    let mut out = Args::new();
-    out.add_u64(amount);
-    out.into_bytes()
+    let owner = args.next_string().expect("owner argument is missing or invalid");
+    let spender = args.next_string().expect("spenderAddress argument is missing or invalid");
+    
+    let amount = get_allowance(&owner, &spender);
+    amount.to_le_bytes().to_vec()
 }
 
-/// Transfer tokens from one address to another using allowance.
+/// Increases the allowance of the spender on the caller's account.
 ///
 /// # Arguments
-/// - `from`: Source address (string)
-/// - `to`: Destination address (string)
-/// - `amount`: Amount to transfer (u64)
-///
-/// # Returns
-/// - Success flag as bool
+/// - `spender`: Spender address (string)
+/// - `amount`: Amount to increase (u256 as bytes)
 ///
 /// # Events
-/// - `TRANSFER:{from}:{to}:{amount}` on success
-/// - `ERROR:...` on failure
+/// - `APPROVAL SUCCESS`
+#[massa_export]
+pub fn increaseAllowance(binary_args: &[u8]) -> Vec<u8> {
+    let mut args = Args::from_bytes(binary_args.to_vec());
+    let spender = args.next_string().expect("spenderAddress argument is missing or invalid");
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
+    } else {
+        panic!("amount argument is missing or invalid");
+    };
+
+    let owner = context::caller();
+    let current = get_allowance(&owner, &spender);
+    
+    // If overflow, set to max
+    let new_allowance = current.checked_add(amount).unwrap_or(U256::MAX);
+    
+    set_allowance(&owner, &spender, new_allowance);
+
+    abi::generate_event(APPROVAL_EVENT);
+
+    Vec::new()
+}
+
+/// Decreases the allowance of the spender on the caller's account.
+///
+/// # Arguments
+/// - `spender`: Spender address (string)
+/// - `amount`: Amount to decrease (u256 as bytes)
+///
+/// # Events
+/// - `APPROVAL SUCCESS`
+#[massa_export]
+pub fn decreaseAllowance(binary_args: &[u8]) -> Vec<u8> {
+    let mut args = Args::from_bytes(binary_args.to_vec());
+    let spender = args.next_string().expect("spenderAddress argument is missing or invalid");
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
+    } else {
+        panic!("amount argument is missing or invalid");
+    };
+
+    let owner = context::caller();
+    let current = get_allowance(&owner, &spender);
+    
+    // If underflow, set to zero
+    let new_allowance = if current > amount {
+        current.checked_sub(amount).unwrap()
+    } else {
+        U256::ZERO
+    };
+    
+    set_allowance(&owner, &spender, new_allowance);
+
+    abi::generate_event(APPROVAL_EVENT);
+
+    Vec::new()
+}
+
+/// Transfers tokens from owner to recipient using spender's allowance.
+///
+/// # Arguments
+/// - `owner`: Owner address (string)
+/// - `recipient`: Recipient address (string)
+/// - `amount`: Amount to transfer (u256 as bytes)
+///
+/// # Events
+/// - `TRANSFER SUCCESS`
 #[massa_export]
 pub fn transferFrom(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let from = args.next_string().unwrap_or_else(|_| String::new());
-    let to = args.next_string().unwrap_or_else(|_| String::new());
-    let amount = args.next_u64().unwrap_or(0);
+    let owner = args.next_string().expect("ownerAddress argument is missing or invalid");
+    let recipient = args.next_string().expect("recipientAddress argument is missing or invalid");
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
+    } else {
+        panic!("amount argument is missing or invalid");
+    };
 
     let spender = context::caller();
-
-    // Validate inputs
-    if to.is_empty() {
-        abi::generate_event("ERROR:transferFrom to zero address");
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
-
+    
+    assert!(owner != recipient, "Transfer failed: cannot send tokens to own account");
+    
     // Check allowance
-    let current_allowance = get_allowance_internal(&from, &spender);
-    if current_allowance < amount {
-        abi::generate_event(&format!(
-            "ERROR:insufficient allowance: has {} needs {}",
-            current_allowance, amount
-        ));
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
-
+    let spender_allowance = get_allowance(&owner, &spender);
+    assert!(spender_allowance >= amount, "transferFrom failed: insufficient allowance");
+    
     // Check balance
-    let from_balance = get_balance_internal(&from);
-    if from_balance < amount {
-        abi::generate_event(&format!(
-            "ERROR:insufficient balance: has {} needs {}",
-            from_balance, amount
-        ));
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
+    let owner_balance = get_balance(&owner);
+    let recipient_balance = get_balance(&recipient);
+    
+    assert!(owner_balance >= amount, "Transfer failed: insufficient funds");
+    
+    let new_recipient_balance = recipient_balance.checked_add(amount).expect("Transfer failed: overflow");
+    let new_owner_balance = owner_balance.checked_sub(amount).unwrap();
+    let new_allowance = spender_allowance.checked_sub(amount).unwrap();
+    
+    set_balance(&owner, new_owner_balance);
+    set_balance(&recipient, new_recipient_balance);
+    set_allowance(&owner, &spender, new_allowance);
 
-    // Update allowance
-    set_allowance_internal(&from, &spender, current_allowance - amount);
+    abi::generate_event(TRANSFER_EVENT);
 
-    // Perform transfer
-    set_balance_internal(&from, from_balance - amount);
-    let to_balance = get_balance_internal(&to);
-    set_balance_internal(&to, to_balance + amount);
-
-    abi::generate_event(&format!("TRANSFER:{}:{}:{}", from, to, amount));
-
-    let mut out = Args::new();
-    out.add_bool(true);
-    out.into_bytes()
+    Vec::new()
 }
 
-/// Mint new tokens (only callable by contract owner - in this demo, anyone can mint for testing).
-/// In production, you'd add access control.
+// ============================================================================
+// Mintable (owner only)
+// ============================================================================
+
+/// Mint tokens to recipient (owner only).
 ///
 /// # Arguments
-/// - `to`: Recipient address (string)
-/// - `amount`: Amount to mint (u64)
-///
-/// # Returns
-/// - Success flag as bool
+/// - `recipient`: Recipient address (string)
+/// - `amount`: Amount to mint (u256 as bytes)
 ///
 /// # Events
-/// - `TRANSFER:0x0:{to}:{amount}` (mint event)
+/// - `MINT SUCCESS`
 #[massa_export]
 pub fn mint(binary_args: &[u8]) -> Vec<u8> {
+    only_owner();
+    
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let to = args.next_string().unwrap_or_else(|_| String::new());
-    let amount = args.next_u64().unwrap_or(0);
-
-    if to.is_empty() {
-        abi::generate_event("ERROR:mint to zero address");
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
-
-    // Update total supply
-    let supply_data = storage::get(KEY_TOTAL_SUPPLY);
-    let current_supply = if supply_data.len() >= 8 {
-        u64::from_le_bytes([
-            supply_data[0],
-            supply_data[1],
-            supply_data[2],
-            supply_data[3],
-            supply_data[4],
-            supply_data[5],
-            supply_data[6],
-            supply_data[7],
-        ])
+    let recipient = args.next_string().expect("recipient argument is missing or invalid");
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
     } else {
-        0
+        panic!("amount argument is missing or invalid");
     };
-    let new_supply = current_supply.saturating_add(amount);
-    storage::set(KEY_TOTAL_SUPPLY, &new_supply.to_le_bytes());
 
-    // Update recipient balance
-    let to_balance = get_balance_internal(&to);
-    set_balance_internal(&to, to_balance.saturating_add(amount));
+    // Increase total supply
+    let old_supply = get_total_supply();
+    let new_supply = old_supply.checked_add(amount).expect("Requested mint amount causes an overflow");
+    set_total_supply(new_supply);
+    
+    // Increase recipient balance
+    let old_balance = get_balance(&recipient);
+    let new_balance = old_balance.checked_add(amount).expect("Requested mint amount causes an overflow");
+    set_balance(&recipient, new_balance);
 
-    abi::generate_event(&format!("TRANSFER:0x0:{}:{}", to, amount));
+    abi::generate_event(MINT_EVENT);
 
-    let mut out = Args::new();
-    out.add_bool(true);
-    out.into_bytes()
+    Vec::new()
 }
+
+// ============================================================================
+// Burnable
+// ============================================================================
 
 /// Burn tokens from caller's balance.
 ///
 /// # Arguments
-/// - `amount`: Amount to burn (u64)
-///
-/// # Returns
-/// - Success flag as bool
+/// - `amount`: Amount to burn (u256 as bytes)
 ///
 /// # Events
-/// - `TRANSFER:{from}:0x0:{amount}` (burn event)
+/// - `BURN_SUCCESS`
 #[massa_export]
 pub fn burn(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let amount = args.next_u64().unwrap_or(0);
-
-    let from = context::caller();
-
-    let from_balance = get_balance_internal(&from);
-    if from_balance < amount {
-        abi::generate_event(&format!(
-            "ERROR:insufficient balance to burn: has {} needs {}",
-            from_balance, amount
-        ));
-        let mut out = Args::new();
-        out.add_bool(false);
-        return out.into_bytes();
-    }
-
-    // Update balance
-    set_balance_internal(&from, from_balance - amount);
-
-    // Update total supply
-    let supply_data = storage::get(KEY_TOTAL_SUPPLY);
-    let current_supply = if supply_data.len() >= 8 {
-        u64::from_le_bytes([
-            supply_data[0],
-            supply_data[1],
-            supply_data[2],
-            supply_data[3],
-            supply_data[4],
-            supply_data[5],
-            supply_data[6],
-            supply_data[7],
-        ])
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
     } else {
-        0
+        panic!("amount argument is missing or invalid");
     };
-    let new_supply = current_supply.saturating_sub(amount);
-    storage::set(KEY_TOTAL_SUPPLY, &new_supply.to_le_bytes());
 
-    abi::generate_event(&format!("TRANSFER:{}:0x0:{}", from, amount));
+    let caller = context::caller();
+    
+    // Decrease total supply
+    let old_supply = get_total_supply();
+    let new_supply = old_supply.checked_sub(amount)
+        .expect("Requested burn amount causes an underflow of the total supply");
+    set_total_supply(new_supply);
+    
+    // Decrease caller balance
+    let old_balance = get_balance(&caller);
+    let new_balance = old_balance.checked_sub(amount)
+        .expect("Requested burn amount causes an underflow of the recipient balance");
+    set_balance(&caller, new_balance);
 
-    let mut out = Args::new();
-    out.add_bool(true);
-    out.into_bytes()
+    abi::generate_event(BURN_EVENT);
+
+    Vec::new()
+}
+
+/// Burn tokens from owner using spender's allowance.
+///
+/// # Arguments
+/// - `owner`: Owner address (string)
+/// - `amount`: Amount to burn (u256 as bytes)
+///
+/// # Events
+/// - `BURN_SUCCESS`
+#[massa_export]
+pub fn burnFrom(binary_args: &[u8]) -> Vec<u8> {
+    let mut args = Args::from_bytes(binary_args.to_vec());
+    let owner = args.next_string().expect("owner argument is missing or invalid");
+    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
+    
+    let amount = if amount_bytes.len() >= 32 {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&amount_bytes[..32]);
+        U256::from_le_bytes(arr)
+    } else {
+        panic!("amount argument is missing or invalid");
+    };
+
+    let spender = context::caller();
+    
+    // Check allowance
+    let spender_allowance = get_allowance(&owner, &spender);
+    assert!(spender_allowance >= amount, "burnFrom failed: insufficient allowance");
+    
+    // Decrease total supply
+    let old_supply = get_total_supply();
+    let new_supply = old_supply.checked_sub(amount)
+        .expect("Requested burn amount causes an underflow of the total supply");
+    set_total_supply(new_supply);
+    
+    // Decrease owner balance
+    let old_balance = get_balance(&owner);
+    let new_balance = old_balance.checked_sub(amount)
+        .expect("Requested burn amount causes an underflow of the recipient balance");
+    set_balance(&owner, new_balance);
+    
+    // Decrease allowance
+    let new_allowance = spender_allowance.checked_sub(amount).unwrap();
+    set_allowance(&owner, &spender, new_allowance);
+
+    abi::generate_event(BURN_EVENT);
+
+    Vec::new()
+}
+
+// ============================================================================
+// Ownership
+// ============================================================================
+
+/// Set the contract owner (only current owner can call, or anyone if no owner set).
+///
+/// # Arguments
+/// - `newOwner`: New owner address (string)
+///
+/// # Events
+/// - `CHANGE_OWNER:newOwner`
+#[massa_export]
+pub fn setOwner(binary_args: &[u8]) -> Vec<u8> {
+    let mut args = Args::from_bytes(binary_args.to_vec());
+    let new_owner = args.next_string().expect("newOwnerAddress argument is missing or invalid");
+    
+    // If owner exists, only owner can change
+    if get_owner().is_some() {
+        only_owner();
+    }
+    
+    set_owner_internal(&new_owner);
+    
+    abi::generate_event(&alloc::format!("{}:{}", CHANGE_OWNER_EVENT, new_owner));
+
+    Vec::new()
+}
+
+/// Returns the owner address (raw bytes).
+#[massa_export]
+pub fn ownerAddress(_binary_args: &[u8]) -> Vec<u8> {
+    if !storage::has(OWNER_KEY) {
+        return Vec::new();
+    }
+    storage::get(OWNER_KEY)
+}
+
+/// Returns true (1) if address is owner, false (0) otherwise.
+///
+/// # Arguments
+/// - `address`: Address to check (string)
+#[massa_export]
+pub fn isOwner(binary_args: &[u8]) -> Vec<u8> {
+    if !storage::has(OWNER_KEY) {
+        return alloc::vec![0u8];
+    }
+    let mut args = Args::from_bytes(binary_args.to_vec());
+    let address = args.next_string().expect("address argument is missing or invalid");
+    
+    if is_owner_check(&address) {
+        alloc::vec![1u8]
+    } else {
+        alloc::vec![0u8]
+    }
 }
