@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+  "contracts/erc20-token",
+  "tests/erc20-tests",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+hex = "0.4"
+massa-args = { git = "https://github.com/damip/vibe_massa_rust_sdk", package = "massa-args" }
+massa-sc-sdk = { git = "https://github.com/damip/vibe_massa_rust_sdk", package = "massa-sc-sdk", default-features = false, features = ["panic-abort"] }
+massa-export = { git = "https://github.com/damip/vibe_massa_rust_sdk", package = "massa-export" }
+massa-testkit = { git = "https://github.com/damip/vibe_massa_rust_sdk", package = "massa-testkit" }
