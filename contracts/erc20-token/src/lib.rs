@@ -8,6 +8,7 @@
 //! - Function signatures match AS implementation
 //! - Event names and formats match AS implementation
 //! - Can be deployed using the same deployer as AS contracts
+//! - Uses U256 for all token amounts (256-bit integers)
 //!
 //! # Storage Keys
 //! - `NAME`: Token name as raw bytes
@@ -25,94 +26,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use massa_export::massa_export;
-use massa_sc_sdk::{abi, context, storage, Args};
-
-// ============================================================================
-// U256 Implementation (little-endian, compatible with AS as-bignum)
-// ============================================================================
-
-/// 256-bit unsigned integer, little-endian byte order
-/// Compatible with AssemblyScript's as-bignum u256
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct U256(pub [u8; 32]);
-
-impl U256 {
-    pub const ZERO: U256 = U256([0u8; 32]);
-    pub const MAX: U256 = U256([0xFF; 32]);
-
-    pub fn from_le_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn to_le_bytes(self) -> [u8; 32] {
-        self.0
-    }
-
-    pub fn from_u64(value: u64) -> Self {
-        let mut bytes = [0u8; 32];
-        bytes[..8].copy_from_slice(&value.to_le_bytes());
-        Self(bytes)
-    }
-
-    /// Checked addition, returns None on overflow
-    pub fn checked_add(self, other: U256) -> Option<U256> {
-        let mut result = [0u8; 32];
-        let mut carry: u16 = 0;
-        for i in 0..32 {
-            let sum = self.0[i] as u16 + other.0[i] as u16 + carry;
-            result[i] = sum as u8;
-            carry = sum >> 8;
-        }
-        if carry != 0 {
-            None // Overflow
-        } else {
-            Some(U256(result))
-        }
-    }
-
-    /// Checked subtraction, returns None on underflow
-    pub fn checked_sub(self, other: U256) -> Option<U256> {
-        if self < other {
-            return None;
-        }
-        let mut result = [0u8; 32];
-        let mut borrow: i16 = 0;
-        for i in 0..32 {
-            let diff = self.0[i] as i16 - other.0[i] as i16 - borrow;
-            if diff < 0 {
-                result[i] = (diff + 256) as u8;
-                borrow = 1;
-            } else {
-                result[i] = diff as u8;
-                borrow = 0;
-            }
-        }
-        Some(U256(result))
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0.iter().all(|&b| b == 0)
-    }
-}
-
-impl PartialOrd for U256 {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for U256 {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // Compare from most significant byte to least significant
-        for i in (0..32).rev() {
-            match self.0[i].cmp(&other.0[i]) {
-                core::cmp::Ordering::Equal => continue,
-                other => return other,
-            }
-        }
-        core::cmp::Ordering::Equal
-    }
-}
+use massa_sc_sdk::{abi, context, storage, Args, U256};
 
 // ============================================================================
 // Constants - Storage Keys (matching AS implementation exactly)
@@ -220,7 +134,7 @@ fn get_owner() -> Option<String> {
         return None;
     }
     let data = storage::get(OWNER_KEY);
-    core::str::from_utf8(&data).ok().map(|s| String::from(s))
+    core::str::from_utf8(&data).ok().map(String::from)
 }
 
 fn set_owner_internal(owner: &str) {
@@ -231,10 +145,7 @@ fn only_owner() {
     let owner = get_owner();
     assert!(owner.is_some(), "Owner is not set");
     let caller = context::caller();
-    assert!(
-        caller == owner.unwrap(),
-        "Caller is not the owner"
-    );
+    assert!(caller == owner.unwrap(), "Caller is not the owner");
 }
 
 fn is_owner_check(address: &str) -> bool {
@@ -254,7 +165,7 @@ fn is_owner_check(address: &str) -> bool {
 /// - `name`: Token name (string)
 /// - `symbol`: Token symbol (string)
 /// - `decimals`: Token decimals (u8)
-/// - `totalSupply`: Initial supply as u256 (32 bytes)
+/// - `totalSupply`: Initial supply as U256 (32 bytes)
 ///
 /// The caller becomes the owner and receives all initial tokens.
 #[massa_export]
@@ -265,19 +176,7 @@ pub fn constructor(binary_args: &[u8]) -> Vec<u8> {
     let name = args.next_string().unwrap_or_else(|_| String::from("MassaToken"));
     let symbol = args.next_string().unwrap_or_else(|_| String::from("MT"));
     let decimals = args.next_u8().unwrap_or(18);
-    
-    // Read u256 as 32 bytes
-    let total_supply = if let Ok(bytes) = args.next_bytes() {
-        if bytes.len() >= 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&bytes[..32]);
-            U256::from_le_bytes(arr)
-        } else {
-            U256::from_u64(1_000_000_000_000_000_000) // Default 1 token with 18 decimals
-        }
-    } else {
-        U256::from_u64(1_000_000_000_000_000_000)
-    };
+    let total_supply = args.next_u256().unwrap_or_else(|_| U256::from(1_000_000_000_000_000_000u64));
 
     // Store token metadata (raw bytes, matching AS format)
     storage::set(NAME_KEY, name.as_bytes());
@@ -354,7 +253,7 @@ pub fn balanceOf(binary_args: &[u8]) -> Vec<u8> {
 ///
 /// # Arguments
 /// - `to`: Recipient address (string)
-/// - `amount`: Amount to transfer (u256 as bytes)
+/// - `amount`: Amount to transfer (U256)
 ///
 /// # Events
 /// - `TRANSFER SUCCESS`
@@ -362,15 +261,7 @@ pub fn balanceOf(binary_args: &[u8]) -> Vec<u8> {
 pub fn transfer(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
     let to = args.next_string().expect("receiverAddress argument is missing or invalid");
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
     let from = context::caller();
     
@@ -382,7 +273,7 @@ pub fn transfer(binary_args: &[u8]) -> Vec<u8> {
     assert!(from_balance >= amount, "Transfer failed: insufficient funds");
     
     let new_to_balance = to_balance.checked_add(amount).expect("Transfer failed: overflow");
-    let new_from_balance = from_balance.checked_sub(amount).unwrap();
+    let new_from_balance = from_balance.checked_sub(amount).expect("Transfer failed: underflow");
     
     set_balance(&from, new_from_balance);
     set_balance(&to, new_to_balance);
@@ -415,7 +306,7 @@ pub fn allowance(binary_args: &[u8]) -> Vec<u8> {
 ///
 /// # Arguments
 /// - `spender`: Spender address (string)
-/// - `amount`: Amount to increase (u256 as bytes)
+/// - `amount`: Amount to increase (U256)
 ///
 /// # Events
 /// - `APPROVAL SUCCESS`
@@ -423,21 +314,13 @@ pub fn allowance(binary_args: &[u8]) -> Vec<u8> {
 pub fn increaseAllowance(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
     let spender = args.next_string().expect("spenderAddress argument is missing or invalid");
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
     let owner = context::caller();
     let current = get_allowance(&owner, &spender);
     
-    // If overflow, set to max
-    let new_allowance = current.checked_add(amount).unwrap_or(U256::MAX);
+    // If overflow, set to max (matching AS behavior)
+    let new_allowance = current.saturating_add(amount);
     
     set_allowance(&owner, &spender, new_allowance);
 
@@ -450,7 +333,7 @@ pub fn increaseAllowance(binary_args: &[u8]) -> Vec<u8> {
 ///
 /// # Arguments
 /// - `spender`: Spender address (string)
-/// - `amount`: Amount to decrease (u256 as bytes)
+/// - `amount`: Amount to decrease (U256)
 ///
 /// # Events
 /// - `APPROVAL SUCCESS`
@@ -458,25 +341,13 @@ pub fn increaseAllowance(binary_args: &[u8]) -> Vec<u8> {
 pub fn decreaseAllowance(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
     let spender = args.next_string().expect("spenderAddress argument is missing or invalid");
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
     let owner = context::caller();
     let current = get_allowance(&owner, &spender);
     
-    // If underflow, set to zero
-    let new_allowance = if current > amount {
-        current.checked_sub(amount).unwrap()
-    } else {
-        U256::ZERO
-    };
+    // If underflow, set to zero (matching AS behavior)
+    let new_allowance = current.saturating_sub(amount);
     
     set_allowance(&owner, &spender, new_allowance);
 
@@ -490,7 +361,7 @@ pub fn decreaseAllowance(binary_args: &[u8]) -> Vec<u8> {
 /// # Arguments
 /// - `owner`: Owner address (string)
 /// - `recipient`: Recipient address (string)
-/// - `amount`: Amount to transfer (u256 as bytes)
+/// - `amount`: Amount to transfer (U256)
 ///
 /// # Events
 /// - `TRANSFER SUCCESS`
@@ -499,15 +370,7 @@ pub fn transferFrom(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
     let owner = args.next_string().expect("ownerAddress argument is missing or invalid");
     let recipient = args.next_string().expect("recipientAddress argument is missing or invalid");
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
     let spender = context::caller();
     
@@ -523,9 +386,10 @@ pub fn transferFrom(binary_args: &[u8]) -> Vec<u8> {
     
     assert!(owner_balance >= amount, "Transfer failed: insufficient funds");
     
+    // Safe arithmetic
     let new_recipient_balance = recipient_balance.checked_add(amount).expect("Transfer failed: overflow");
-    let new_owner_balance = owner_balance.checked_sub(amount).unwrap();
-    let new_allowance = spender_allowance.checked_sub(amount).unwrap();
+    let new_owner_balance = owner_balance.checked_sub(amount).expect("Transfer failed: underflow");
+    let new_allowance = spender_allowance.checked_sub(amount).expect("Allowance underflow");
     
     set_balance(&owner, new_owner_balance);
     set_balance(&recipient, new_recipient_balance);
@@ -544,7 +408,7 @@ pub fn transferFrom(binary_args: &[u8]) -> Vec<u8> {
 ///
 /// # Arguments
 /// - `recipient`: Recipient address (string)
-/// - `amount`: Amount to mint (u256 as bytes)
+/// - `amount`: Amount to mint (U256)
 ///
 /// # Events
 /// - `MINT SUCCESS`
@@ -554,22 +418,14 @@ pub fn mint(binary_args: &[u8]) -> Vec<u8> {
     
     let mut args = Args::from_bytes(binary_args.to_vec());
     let recipient = args.next_string().expect("recipient argument is missing or invalid");
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
-    // Increase total supply
+    // Increase total supply with overflow check
     let old_supply = get_total_supply();
     let new_supply = old_supply.checked_add(amount).expect("Requested mint amount causes an overflow");
     set_total_supply(new_supply);
     
-    // Increase recipient balance
+    // Increase recipient balance with overflow check
     let old_balance = get_balance(&recipient);
     let new_balance = old_balance.checked_add(amount).expect("Requested mint amount causes an overflow");
     set_balance(&recipient, new_balance);
@@ -586,32 +442,24 @@ pub fn mint(binary_args: &[u8]) -> Vec<u8> {
 /// Burn tokens from caller's balance.
 ///
 /// # Arguments
-/// - `amount`: Amount to burn (u256 as bytes)
+/// - `amount`: Amount to burn (U256)
 ///
 /// # Events
 /// - `BURN_SUCCESS`
 #[massa_export]
 pub fn burn(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
     let caller = context::caller();
     
-    // Decrease total supply
+    // Decrease total supply with underflow check
     let old_supply = get_total_supply();
     let new_supply = old_supply.checked_sub(amount)
         .expect("Requested burn amount causes an underflow of the total supply");
     set_total_supply(new_supply);
     
-    // Decrease caller balance
+    // Decrease caller balance with underflow check
     let old_balance = get_balance(&caller);
     let new_balance = old_balance.checked_sub(amount)
         .expect("Requested burn amount causes an underflow of the recipient balance");
@@ -626,7 +474,7 @@ pub fn burn(binary_args: &[u8]) -> Vec<u8> {
 ///
 /// # Arguments
 /// - `owner`: Owner address (string)
-/// - `amount`: Amount to burn (u256 as bytes)
+/// - `amount`: Amount to burn (U256)
 ///
 /// # Events
 /// - `BURN_SUCCESS`
@@ -634,15 +482,7 @@ pub fn burn(binary_args: &[u8]) -> Vec<u8> {
 pub fn burnFrom(binary_args: &[u8]) -> Vec<u8> {
     let mut args = Args::from_bytes(binary_args.to_vec());
     let owner = args.next_string().expect("owner argument is missing or invalid");
-    let amount_bytes = args.next_bytes().expect("amount argument is missing or invalid");
-    
-    let amount = if amount_bytes.len() >= 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&amount_bytes[..32]);
-        U256::from_le_bytes(arr)
-    } else {
-        panic!("amount argument is missing or invalid");
-    };
+    let amount = args.next_u256().expect("amount argument is missing or invalid");
 
     let spender = context::caller();
     
@@ -650,20 +490,20 @@ pub fn burnFrom(binary_args: &[u8]) -> Vec<u8> {
     let spender_allowance = get_allowance(&owner, &spender);
     assert!(spender_allowance >= amount, "burnFrom failed: insufficient allowance");
     
-    // Decrease total supply
+    // Decrease total supply with underflow check
     let old_supply = get_total_supply();
     let new_supply = old_supply.checked_sub(amount)
         .expect("Requested burn amount causes an underflow of the total supply");
     set_total_supply(new_supply);
     
-    // Decrease owner balance
+    // Decrease owner balance with underflow check
     let old_balance = get_balance(&owner);
     let new_balance = old_balance.checked_sub(amount)
         .expect("Requested burn amount causes an underflow of the recipient balance");
     set_balance(&owner, new_balance);
     
     // Decrease allowance
-    let new_allowance = spender_allowance.checked_sub(amount).unwrap();
+    let new_allowance = spender_allowance.checked_sub(amount).expect("Allowance underflow");
     set_allowance(&owner, &spender, new_allowance);
 
     abi::generate_event(BURN_EVENT);

@@ -7,5 +7,5 @@ license.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 hex = { workspace = true }
-massa-args = { workspace = true, features = ["std"] }
+massa-types = { workspace = true, features = ["std"] }
 massa-testkit = { workspace = true }
