@@ -23,6 +23,16 @@ This contract is **fully compatible** with the [MRC20 standard](https://github.c
 | `ALLOWANCE{owner}{spender}` | 32 bytes (U256 LE) | Allowance |
 | `OWNER` | raw string bytes | Contract owner |
 
+## Deployed on Mainnet
+
+**Contract Address**: `AS1yLqg2TPKCuZ3mTFdGNdtx2WTbFW7mm7D3SrU2nzu6FLzghku`
+
+- Token Name: RustyCoin
+- Token Symbol: RUSTY
+- Decimals: 2
+- Total Supply: 1,000,000 tokens (100,000,000 smallest units)
+- Token Holder: `AU16MSc4w3dGrhyLkStkk2pMtDT6rtkyVLqy7MVyuk68KiMavYdr`
+
 ## Deployed on Buildnet
 
 **Contract Address**: `AS1pZsJGd49trYhTGo4cDfpMruLDebgQ3YFcLHFaaZ7EsKg3YN26`
@@ -138,6 +148,100 @@ let sum = a.checked_add(b).expect("overflow");
 let mut args = Args::new();
 args.add_u256(sum);
 ```
+
+## Deploying on Mainnet
+
+Once you've tested your smart contract on buildnet, deploying to mainnet follows the same process with a different RPC endpoint.
+
+### Prerequisites
+
+1. Clone and build the Massa Rust SDK CLI:
+   ```bash
+   git clone https://github.com/damip/vibe_massa_rust_sdk.git /tmp/vibe_massa_rust_sdk
+   cd /tmp/vibe_massa_rust_sdk
+   cargo build -p massa-cli --release
+   ```
+
+2. Build your contract:
+   ```bash
+   cargo build -p erc20-token --release --target wasm32v1-none
+   ```
+
+### RPC Endpoints
+
+| Network  | RPC Endpoint                          |
+|----------|---------------------------------------|
+| Buildnet | `https://buildnet.massa.net/api/v2`   |
+| Mainnet  | `https://mainnet.massa.net/api/v2`    |
+
+### Creating Constructor Arguments
+
+Constructor arguments must be serialized using the `Args` format. For an MRC20 token:
+- `name`: string (length u32 LE + UTF-8 bytes)
+- `symbol`: string (length u32 LE + UTF-8 bytes)
+- `decimals`: u8 (single byte)
+- `totalSupply`: U256 (32 bytes little-endian)
+
+Example using the CLI to build args (for types it supports):
+```bash
+/tmp/vibe_massa_rust_sdk/target/release/massa-cli args \
+  --arg string:MyToken \
+  --arg string:MTK \
+  --out ./constructor.args
+```
+
+For `u8` and `U256` types not directly supported by the CLI, you can write a small Rust helper or compute the hex manually.
+
+### Deploy to Mainnet
+
+```bash
+/tmp/vibe_massa_rust_sdk/target/release/massa-cli deploy \
+  --rpc https://mainnet.massa.net/api/v2 \
+  --private-key <YOUR_MAINNET_PRIVATE_KEY> \
+  --bytecode target/wasm32v1-none/release/erc20_token.wasm \
+  --args-file ./constructor.args \
+  --coins 0.1 \
+  --wait-final
+```
+
+**Important notes:**
+- Ensure your mainnet wallet has sufficient MAS tokens for deployment costs (gas + storage)
+- Storage cost is approximately 0.0001 MAS per byte
+- The `--coins` parameter specifies MAS tokens to send to the contract constructor
+- Use `--wait-final` to wait for the operation to be finalized
+
+### Call a Function on Mainnet
+
+```bash
+# Create function arguments
+/tmp/vibe_massa_rust_sdk/target/release/massa-cli args \
+  --arg string:AU1someRecipientAddress... \
+  --out ./transfer.args
+
+# Call the transfer function
+/tmp/vibe_massa_rust_sdk/target/release/massa-cli call \
+  --rpc https://mainnet.massa.net/api/v2 \
+  --private-key <YOUR_MAINNET_PRIVATE_KEY> \
+  --target <CONTRACT_ADDRESS> \
+  --function transfer \
+  --args-file ./transfer.args \
+  --coins 0 \
+  --wait-final
+```
+
+### Read Events
+
+```bash
+/tmp/vibe_massa_rust_sdk/target/release/massa-cli events \
+  --rpc https://mainnet.massa.net/api/v2 \
+  --operation-id <OPERATION_ID> \
+  --final-only
+```
+
+### Getting MAS Tokens
+
+- **Buildnet**: Use the [Massa faucet](https://discord.gg/massa) on Discord
+- **Mainnet**: Purchase MAS on exchanges or receive from other users
 
 ## License
 
